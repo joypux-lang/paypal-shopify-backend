@@ -243,7 +243,11 @@ app.post("/api/shopify/order-from-paypal", async (req, res) => {
           : null,
       note: `PayPal order: ${b.paypalOrderId || ""} | capture: ${b.paypalCaptureId || ""}`.trim()
     };
+    console.log("📦 Draft input =>", JSON.stringify(draftInput, null, 2));
+
     const d1 = await shopifyGraphQL(draftOrderCreate, { input: draftInput });
+    console.log("🧾 Shopify response =>", JSON.stringify(d1, null, 2));
+
     const ue1 = d1?.draftOrderCreate?.userErrors || [];
     if (ue1.length)
       return res.status(400).json({ error: "Shopify user errors", details: ue1 });
