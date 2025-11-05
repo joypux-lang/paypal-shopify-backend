@@ -1,173 +1,316 @@
-<script>
-document.addEventListener('DOMContentLoaded', function () {
-  var API_BASE = "{{ section.settings.api_base_url | escape }}".replace(/\/+$/,'');
-  var currency = "{{ cart.currency.iso_code }}";
+// server.js — Final
+import express from "express";
+import cors from "cors";
+import helmet from "helmet";
+import fetch from "node-fetch";
 
-  // ✅ مجموع السلة من Shopify كسِنت → إلى عملة (أدق لكل اللغات/التنسيقات)
-  var cartSubtotal = ({{ cart.total_price | default: 0 }}) / 100.0;
+const app = express();
+app.use(helmet());
+app.use(express.json({ limit: "1mb" }));
 
-  // تنسيق المبالغ حسب العملة
-  function fmt(v) {
-    try {
-      return new Intl.NumberFormat(undefined, { style: 'currency', currency }).format(v);
-    } catch (e) {
-      return (v || 0).toFixed(2) + ' ' + currency;
-    }
-  }
+// CORS
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
+app.use(cors({ origin: ALLOWED_ORIGIN === "*" ? true : [ALLOWED_ORIGIN] }));
 
-  function shipValue(){
-    var r = document.querySelector('input[name="co-ship"]:checked');
-    return parseFloat(r && r.value || 0);
-  }
-  function shipLabel(){
-    var r = document.querySelector('input[name="co-ship"]:checked');
-    return r ? (r.getAttribute('data-label') || 'Shipping') : 'Shipping';
-  }
-  function total(){ return (cartSubtotal + shipValue()); }
-  function renderTotals(){
-    var sEl = document.getElementById('co-ship-val');
-    var tEl = document.getElementById('co-total');
-    if (sEl) sEl.textContent = shipValue() ? fmt(shipValue()) : '—';
-    if (tEl) tEl.textContent = fmt(total());
-  }
-  document.querySelectorAll('input[name="co-ship"]').forEach(function(el){ el.addEventListener('change', renderTotals); });
-  renderTotals();
+// ===== Env =====
+const {
+  PAYPAL_CLIENT_ID,
+  PAYPAL_CLIENT_SECRET,
+  PAYPAL_ENV = "live",
+  SHOPIFY_STORE,               // مثل: "yourstore"
+  SHOPIFY_ADMIN_TOKEN,
+  SHOPIFY_API_VERSION = "2025-10",
+} = process.env;
 
-  function showErr(msg){
-    var el = document.getElementById('co-alert');
-    if (el) {
-      el.textContent = msg || 'Something went wrong.';
-      el.hidden = false;
-    }
-  }
-  function clearErr(){ var el = document.getElementById('co-alert'); if (el) el.hidden = true; }
+if (!PAYPAL_CLIENT_ID || !PAYPAL_CLIENT_SECRET) {
+  console.warn("⚠️ Missing PayPal credentials");
+}
+if (!SHOPIFY_STORE || !SHOPIFY_ADMIN_TOKEN) {
+  console.warn("⚠️ Missing Shopify credentials");
+}
 
-  if ({{ cart.item_count | default: 0 }} <= 0) {
-    showErr('Your cart is empty.');
-    return;
-  }
+const PP_BASE =
+  PAYPAL_ENV === "sandbox"
+    ? "https://api-m.sandbox.paypal.com"
+    : "https://api-m.paypal.com";
 
-  // 🔥 توزيع أي فرق خصم على البنود وإرسال price مخصص لكل بند
-  function buildAdjustedLineItems(){
-    // line_price من Shopify بالسنت → عملة
-    var items = [
-      {% for item in cart.items %}
-      {
-        variant_id: {{ item.variant_id }},
-        quantity: {{ item.quantity }},
-        line_subtotal: ({{ item.line_price }}) / 100.0
-      }{% unless forloop.last %},{% endunless %}
-      {% endfor %}
-    ];
+const SHOP_ADMIN = `https://${SHOPIFY_STORE}.myshopify.com/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
 
-    var currentSubtotal = items.reduce(function(s, it){ return s + it.line_subtotal; }, 0);
-    var targetSubtotal  = total() - shipValue(); // المجموع المرغوب بدون الشحن
-
-    var diff = +(currentSubtotal - targetSubtotal).toFixed(2);
-    if (Math.abs(diff) < 0.01) {
-      // لا يوجد فرق فعلي → لا نرسل price (Shopify يستخدم سعر المتغير)
-      return items.map(function(it){
-        return { variant_id: it.variant_id, quantity: it.quantity };
-      });
-    }
-
-    // وزّع الفرق بنسبة مساهمة كل بند؛ آخر بند يأخذ الباقي لضبط التقريب
-    var adjusted = [];
-    var running = 0;
-    for (var i = 0; i < items.length; i++) {
-      var it = items[i];
-      var share = currentSubtotal > 0 ? (it.line_subtotal / currentSubtotal) : 1/items.length;
-      var newLine = (i < items.length - 1)
-        ? +(targetSubtotal * share).toFixed(2)
-        : +(targetSubtotal - running).toFixed(2);
-      running += newLine;
-
-      var unit = +(newLine / it.quantity).toFixed(2);
-      adjusted.push({
-        variant_id: it.variant_id,
-        quantity: it.quantity,
-        price: unit.toFixed(2) // 👈 سيروح للسيرفر ثم Shopify كـ DraftOrder lineItems.price
-      });
-    }
-    return adjusted;
-  }
-
-  function mountPayPal(){
-    clearErr();
-    if (!window.paypal || !paypal.Buttons) {
-      showErr('Unable to initialize payment. Please refresh the page.');
-      return;
-    }
-    var container = document.getElementById('paypal-button-container');
-    if (container) container.innerHTML = '';
-
-    var buttons = paypal.Buttons({
-      style: { layout: 'vertical', color: 'gold', shape: 'rect', label: 'paypal', tagline:false },
-      createOrder: function(data, actions) {
-        var value = total().toFixed(2);
-        if (!value || isNaN(value)) { console.error('CreateOrder invalid total', value); throw new Error('CreateOrder failed'); }
-        return actions.order.create({
-          intent: 'CAPTURE',
-          purchase_units: [{ amount: { value: value } }],
-          application_context: { user_action: 'PAY_NOW' }
-        });
-      },
-      onApprove: function(data, actions) {
-        return actions.order.capture().then(function(details){
-          var cap = (details && details.purchase_units && details.purchase_units[0] &&
-                     details.purchase_units[0].payments && details.purchase_units[0].payments.captures &&
-                     details.purchase_units[0].payments.captures[0]) || null;
-
-          var payload = {
-            paypalOrderId: data.orderID,
-            paypalCaptureId: cap ? cap.id : null,
-            address: (function(){
-              var pu = (details && details.purchase_units && details.purchase_units[0]) || {};
-              var ship = pu.shipping || {}; var addr = ship.address || {};
-              var full = (ship.name && ship.name.full_name) || '';
-              var parts = full.trim().split(' '); var first = parts.shift() || ''; var last = parts.join(' ') || '';
-              return {
-                firstName: first, lastName: last,
-                address1: addr.address_line_1 || '',
-                city: addr.admin_area_2 || '',
-                zip: addr.postal_code || '',
-                country: addr.country_code || '',
-                email: (details && details.payer && details.payer.email_address) || '',
-                phone: ''
-              };
-            })(),
-            shipping_label: shipLabel(),
-            shipping_price: shipValue().toFixed(2),
-
-            // ✅ البنود بعد التعديل
-            line_items: buildAdjustedLineItems()
-          };
-
-          return fetch(API_BASE + '/api/shopify/order-from-paypal', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-          })
-          .then(function(r){ if (!r.ok) throw new Error('Shopify order failed'); return r.json(); })
-          .then(function(out){
-            if (!out || !out.ok) throw new Error('Shopify order failed');
-            // نظّف السلة ثم حوّل لصفحة الشكر
-            return fetch('/cart/clear.js', { method: 'POST', headers: { 'Content-Type': 'application/json' } })
-              .catch(function(){})
-              .finally(function(){ window.location.href = "{{ section.settings.thank_you_url | default: '/pages/thank-you' }}"; });
-          })
-          .catch(function(err){ console.error('Shopify order error', err); showErr('Payment completed but order creation failed. Please contact support.'); });
-        }).catch(function(err){ console.error('Capture error', err); showErr('Payment could not be completed. Please try again.'); });
-      },
-      onError: function(err){ console.error('PayPal onError', err); showErr('Payment could not be completed. Please try again.'); }
-    });
-
-    buttons.render('#paypal-button-container');
-  }
-
-  mountPayPal();
-  document.querySelectorAll('input[name="co-ship"]').forEach(function(el){
-    el.addEventListener('change', function(){ renderTotals(); mountPayPal(); });
+// ==== Helpers ====
+async function paypalAccessToken() {
+  const res = await fetch(`${PP_BASE}/v1/oauth2/token`, {
+    method: "POST",
+    headers: {
+      Authorization:
+        "Basic " +
+        Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString(
+          "base64"
+        ),
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: "grant_type=client_credentials",
   });
+  const data = await res.json();
+  if (!res.ok)
+    throw new Error(`PayPal OAuth failed: ${res.status} ${JSON.stringify(data)}`);
+  return data.access_token;
+}
+
+async function shopifyGraphQL(query, variables = {}) {
+  const r = await fetch(SHOP_ADMIN, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  const j = await r.json();
+  if (!r.ok || j.errors)
+    throw new Error("Shopify GraphQL error: " + JSON.stringify(j.errors || j));
+  return j.data;
+}
+
+const toVariantGID = (id) => `gid://shopify/ProductVariant/${id}`;
+
+// ==== PayPal Client Token ====
+app.post("/api/paypal/client-token", async (_req, res) => {
+  try {
+    const token = await paypalAccessToken();
+    const r = await fetch(`${PP_BASE}/v1/identity/generate-token`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+    });
+    const j = await r.json();
+    if (!r.ok || !j?.client_token) {
+      return res
+        .status(400)
+        .json({ error: "Failed to generate client token", details: j });
+    }
+    res.json({ ok: true, client_token: j.client_token });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
-</script>
+
+// ==== PayPal Create Order (optional if تستخدم actions.order.create في الواجهة) ====
+app.post("/api/paypal/create-order", async (req, res) => {
+  try {
+    const { value, currency = "USD" } = req.body || {};
+    if (!value) return res.status(400).json({ error: "Missing amount value" });
+
+    const token = await paypalAccessToken();
+    const r = await fetch(`${PP_BASE}/v2/checkout/orders`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        intent: "CAPTURE",
+        purchase_units: [
+          { amount: { currency_code: currency, value: value } },
+        ],
+      }),
+    });
+    const j = await r.json();
+    if (!r.ok)
+      return res
+        .status(r.status)
+        .json({ error: "PayPal create order failed", details: j });
+    res.json({ ok: true, orderID: j.id });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ==== PayPal Capture ====
+app.post("/api/paypal/capture", async (req, res) => {
+  try {
+    const { paypalOrderId } = req.body || {};
+    if (!paypalOrderId)
+      return res.status(400).json({ error: "Missing paypalOrderId" });
+
+    const token = await paypalAccessToken();
+    const capRes = await fetch(
+      `${PP_BASE}/v2/checkout/orders/${paypalOrderId}/capture`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+    const cap = await capRes.json();
+    if (!capRes.ok)
+      return res.status(400).json({ error: "PayPal capture failed", details: cap });
+
+    const status =
+      cap?.status ||
+      cap?.purchase_units?.[0]?.payments?.captures?.[0]?.status;
+    if (status !== "COMPLETED") {
+      return res
+        .status(400)
+        .json({ error: `Unexpected PayPal status: ${status || "unknown"}`, details: cap });
+    }
+
+    const pu = cap?.purchase_units?.[0] || {};
+    const ship = pu?.shipping?.address || {};
+    const name = pu?.shipping?.name?.full_name || "";
+    const payer = cap?.payer || {};
+    const [given_name, ...rest] = (
+      name ||
+      `${payer?.name?.given_name || ""} ${payer?.name?.surname || ""}`
+    )
+      .trim()
+      .split(" ");
+    const surname = rest.join(" ").trim();
+
+    const address = {
+      firstName: given_name || payer?.name?.given_name || "",
+      lastName: surname || payer?.name?.surname || "",
+      address1: ship?.address_line_1 || "",
+      city: ship?.admin_area_2 || "",
+      zip: ship?.postal_code || "",
+      country: ship?.country_code || "",
+      phone: "",
+      email: payer?.email_address || "",
+    };
+
+    const captureId =
+      pu?.payments?.captures?.[0]?.id ||
+      pu?.payments?.authorizations?.[0]?.id ||
+      cap?.id;
+
+    res.json({ ok: true, captureId, address, raw: cap });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/**
+ * ==== Shopify: Draft Order -> Complete ====
+ * يستقبل line_items مع price لو متوفر (سعر للوحدة بعد التوزيع)
+ * الهدف: تسجيل نفس المبلغ النهائي اللي اندفع على PayPal داخل Shopify.
+ */
+app.post("/api/shopify/order-from-paypal", async (req, res) => {
+  try {
+    const b = req.body || {};
+    const errs = [];
+    if (!Array.isArray(b.line_items) || b.line_items.length === 0)
+      errs.push("line_items is required");
+
+    const A = b.address || {};
+    // لا ترسل email داخل العناوين — Shopify MailingAddressInput ما فيه email
+    ["firstName", "lastName", "address1", "city", "zip", "country"].forEach(
+      (k) => {
+        if (!A[k]) errs.push(`address.${k} is required`);
+      }
+    );
+
+    if (b.shipping_label == null) errs.push("shipping_label is required");
+    if (b.shipping_price == null) errs.push("shipping_price is required");
+
+    if (errs.length)
+      return res.status(400).json({ error: "Invalid payload", details: errs });
+
+    // جهّز lineItems لِـ draftOrderCreate.
+    // لو في price بالبايلود (string/number) نمرّره، وإلا نخليه null عشان Shopify يستخدم سعر المتغير.
+    const draftLineItems = b.line_items.map((li) => ({
+      variantId: toVariantGID(li.variant_id),
+      quantity: parseInt(li.quantity, 10),
+      price:
+        li.price !== undefined && li.price !== null && li.price !== ""
+          ? String(li.price)
+          : null,
+    }));
+
+    const draftOrderCreate = `
+      mutation draftOrderCreate($input: DraftOrderInput!) {
+        draftOrderCreate(input: $input) {
+          draftOrder { id }
+          userErrors { field message }
+        }
+      }
+    `;
+
+    const draftInput = {
+      // ما نحط email في العناوين – بس على مستوى الدرافـت ممكن نحط A.email اذا بدك كـ customerEmail
+      email: A.email || undefined,
+      billingAddress: {
+        firstName: A.firstName,
+        lastName: A.lastName,
+        address1: A.address1,
+        city: A.city,
+        zip: A.zip,
+        country: A.country,
+        phone: A.phone || null,
+      },
+      shippingAddress: {
+        firstName: A.firstName,
+        lastName: A.lastName,
+        address1: A.address1,
+        city: A.city,
+        zip: A.zip,
+        country: A.country,
+        phone: A.phone || null,
+      },
+      lineItems: draftLineItems,
+      shippingLine:
+        b.shipping_price !== "" && b.shipping_price != null
+          ? {
+              title: b.shipping_label || "Shipping",
+              price: String(b.shipping_price),
+            }
+          : null,
+      note: `PayPal order: ${b.paypalOrderId || ""} | capture: ${
+        b.paypalCaptureId || ""
+      }`.trim(),
+    };
+
+    const d1 = await shopifyGraphQL(draftOrderCreate, { input: draftInput });
+    const ue1 = d1?.draftOrderCreate?.userErrors || [];
+    if (ue1.length)
+      return res.status(400).json({ error: "Shopify user errors", details: ue1 });
+
+    const draftId = d1?.draftOrderCreate?.draftOrder?.id;
+    if (!draftId)
+      return res
+        .status(400)
+        .json({ error: "Failed to create draft order", details: d1 });
+
+    const draftOrderComplete = `
+      mutation draftOrderComplete($id: ID!) {
+        draftOrderComplete(id: $id) {
+          draftOrder { id order { id name } }
+          userErrors { field message }
+        }
+      }
+    `;
+    const d2 = await shopifyGraphQL(draftOrderComplete, { id: draftId });
+    const ue2 = d2?.draftOrderComplete?.userErrors || [];
+    if (ue2.length)
+      return res.status(400).json({ error: "Shopify user errors", details: ue2 });
+
+    const orderNode = d2?.draftOrderComplete?.draftOrder?.order;
+    if (!orderNode?.id)
+      return res
+        .status(400)
+        .json({ error: "Unable to complete draft order", details: d2 });
+
+    res.json({ ok: true, order: orderNode });
+  } catch (e) {
+    console.error("❌ Shopify Order Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Health
+app.get("/healthz", (_req, res) => res.json({ ok: true }));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ API listening on :${PORT}`));
