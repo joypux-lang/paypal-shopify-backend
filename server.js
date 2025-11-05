@@ -97,35 +97,41 @@ app.post("/api/paypal/client-token", async (_req, res) => {
 });
 
 // ==== PayPal Create Order (optional if تستخدم actions.order.create في الواجهة) ====
-app.post("/api/paypal/create-order", async (req, res) => {
+app.post('/api/shopify/order-from-paypal', async (req, res) => {
   try {
-    const { value, currency = "USD" } = req.body || {};
-    if (!value) return res.status(400).json({ error: "Missing amount value" });
+    const {
+      paypalOrderId,
+      paypalCaptureId,
+      address,
+      shipping_label,
+      shipping_price,
+      line_items
+    } = req.body;
 
-    const token = await paypalAccessToken();
-    const r = await fetch(`${PP_BASE}/v2/checkout/orders`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
+    const draft = await shopify.draftOrder.create({
+      line_items: line_items.map(li => ({
+        variant_id: li.variant_id,
+        quantity: li.quantity,
+        ...(li.price ? { price: parseFloat(li.price) } : {}) // ✅ أهم سطر
+      })),
+      shipping_line: {
+        title: shipping_label,
+        price: parseFloat(shipping_price)
       },
-      body: JSON.stringify({
-        intent: "CAPTURE",
-        purchase_units: [
-          { amount: { currency_code: currency, value: value } },
-        ],
-      }),
+      billing_address: address,
+      shipping_address: address,
+      tags: [`paypal:${paypalOrderId}`, `capture:${paypalCaptureId}`]
     });
-    const j = await r.json();
-    if (!r.ok)
-      return res
-        .status(r.status)
-        .json({ error: "PayPal create order failed", details: j });
-    res.json({ ok: true, orderID: j.id });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+
+    await shopify.draftOrder.complete(draft.id);
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ ok: false, error: 'Order creation failed' });
   }
 });
+
 
 // ==== PayPal Capture ====
 app.post("/api/paypal/capture", async (req, res) => {
